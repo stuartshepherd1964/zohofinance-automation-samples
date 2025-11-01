@@ -1,0 +1,291 @@
+// This was created using ChatGPT5 on 31/10/2025 by Stuart Shepherd
+// The crux of this routine is that it gets called whenever the selling price of an item is changed
+// The routine runs through all recurring invoices and examines each line on the invoice to see if it matches the item that has just been updated
+// If it does, it then looks to see if a price list is active on the line and if so, applies the price list first with the following precedents
+// 		if the price list has a fixed price for the item, this will be used
+//		if the price list shows a markup or markdown % this will be applied to the new selling price and used
+//		if there is no price list the new selling price is inserted
+//
+// You need to setup a workflow rule on the item module to call this routine which is triggered if the selling price is edited.
+//
+// Custom function: update RIs when an item's selling price changes
+orgID = organization.get("organization_id");
+apiUrl = organization.get("api_root_endpoint");
+// 1) make sure we have an item in context
+if(isnull(item))
+{
+	info "No item in context, stopping.";
+	return;
+}
+// 2) get the item + new rate
+itemID = item.get("item_id");
+itemResp = zoho.books.getRecordsByID("items",orgID,itemID,"zbooks");
+itemMap = itemResp.get("item");
+newItemRate = itemMap.get("rate").toDecimal();
+itemCFs = itemMap.get("custom_fields");
+// 4) build pages list (1..10)
+pages = List();
+pages.add(1);
+pages.add(2);
+pages.add(3);
+pages.add(4);
+pages.add(5);
+pages.add(6);
+pages.add(7);
+pages.add(8);
+pages.add(9);
+pages.add(10);
+// 5) first pass: collect all pricebook_ids used on RIs that contain THIS item
+pbIds = List();
+for each  p in pages
+{
+	riListResp = invokeurl
+	[
+		url :apiUrl + "/recurringinvoices?organization_id=" + orgID + "&page=" + p + "&per_page=200"
+		type :GET
+		connection:"zbooks"
+	];
+	riList = riListResp.get("recurring_invoices");
+	if(riList == null || riList.isEmpty())
+	{
+		break;
+	}
+	for each  ri in riList
+	{
+		riId = ri.get("recurring_invoice_id");
+		riFullResp = zoho.books.getRecordsByID("recurringinvoices",orgID,riId,"zbooks");
+		riFull = riFullResp.get("recurring_invoice");
+		lines = riFull.get("line_items");
+		if(lines == null)
+		{
+			continue;
+		}
+		for each  li in lines
+		{
+			if(li.get("item_id") == itemID)
+			{
+				if(li.containKey("pricebook_id") && li.get("pricebook_id") != null && li.get("pricebook_id") != "")
+				{
+					thisPb = li.get("pricebook_id").toString();
+					if(!pbIds.contains(thisPb))
+					{
+						pbIds.add(thisPb);
+					}
+				}
+			}
+		}
+	}
+}
+// 6) fetch & cache those pricebooks
+pbMap = Map();
+for each  pbId in pbIds
+{
+	pbResp = invokeurl
+	[
+		url :apiUrl + "/pricebooks/" + pbId + "?organization_id=" + orgID
+		type :GET
+		connection:"zbooks"
+	];
+	if(pbResp.containKey("pricebook"))
+	{
+		pbMap.put(pbId,pbResp.get("pricebook"));
+	}
+}
+// 7) second pass: walk RIs again and update lines
+for each  p in pages
+{
+	riListResp = invokeurl
+	[
+		url :apiUrl + "/recurringinvoices?organization_id=" + orgID + "&page=" + p + "&per_page=200"
+		type :GET
+		connection:"zbooks"
+	];
+	riList = riListResp.get("recurring_invoices");
+	if(riList == null || riList.isEmpty())
+	{
+		break;
+	}
+	for each  ri in riList
+	{
+		riId = ri.get("recurring_invoice_id");
+		riFullResp = zoho.books.getRecordsByID("recurringinvoices",orgID,riId,"zbooks");
+		riFull = riFullResp.get("recurring_invoice");
+		lines = riFull.get("line_items");
+		if(lines == null)
+		{
+			continue;
+		}
+		cleanLines = List();
+		changed = false;
+		for each  li in lines
+		{
+			liItemId = li.get("item_id");
+			if(liItemId == null)
+			{
+				continue;
+			}
+			// base line payload we send back
+			cl = Map();
+			if(li.containKey("line_item_id"))
+			{
+				cl.put("line_item_id",li.get("line_item_id"));
+			}
+			cl.put("item_id",liItemId);
+			if(li.containKey("quantity") && li.get("quantity") != null)
+			{
+				cl.put("quantity",li.get("quantity"));
+			}
+			if(li.containKey("discount") && li.get("discount") != null)
+			{
+				cl.put("discount",li.get("discount"));
+			}
+			if(li.containKey("discount_type") && li.get("discount_type") != null)
+			{
+				cl.put("discount_type",li.get("discount_type"));
+			}
+			if(li.containKey("rate") && li.get("rate") != null)
+			{
+				cl.put("rate",li.get("rate"));
+			}
+			// only recalc lines that use the item we just changed
+			if(liItemId == itemID)
+			{
+				finalRate = newItemRate;
+				// read explicit line discount (if any)
+				hasPctDisc = false;
+				discPct = 0.0;
+				if(li.containKey("discount") && li.get("discount") != null)
+				{
+					discPct = li.get("discount").toDecimal();
+				}
+				if(li.containKey("discount_type"))
+				{
+					dType = li.get("discount_type");
+					if(dType == "item_level" || dType == "percentage")
+					{
+						hasPctDisc = true;
+					}
+				}
+				// check if this line has a price list
+				if(li.containKey("pricebook_id") && li.get("pricebook_id") != null && li.get("pricebook_id") != "")
+				{
+					thisPbId = li.get("pricebook_id").toString();
+					pb = pbMap.get(thisPbId);
+					if(pb != null)
+					{
+						// your org: fixed_percentage + is_increase + decimal_place
+						pbType = pb.get("pricebook_type");
+						// e.g. "fixed_percentage" or "per_item"
+						pbPerc = pb.get("percentage");
+						// number (e.g. 30.0)
+						pbIsIncrease = pb.get("is_increase");
+						// true = markup, false = discount
+						pbRounding = pb.get("rounding_type");
+						// "round_based_on_decimal"
+						pbDP = pb.get("decimal_place");
+						// 2
+						rateCalc = newItemRate;
+						if(pbType == "fixed_percentage")
+						{
+							pbPercDec = 0.0;
+							if(pbPerc != null)
+							{
+								pbPercDec = pbPerc.toDecimal();
+							}
+							if(pbIsIncrease == true)
+							{
+								// markup
+								rateCalc = (newItemRate * (100 + pbPercDec)) / 100;
+							}
+							else
+							{
+								// markdown
+								rateCalc = (newItemRate * (100 - pbPercDec)) / 100;
+							}
+						}
+						else
+						{
+							// per-item style (or anything else): use the line's stored pricebook_rate if present
+							if(li.containKey("pricebook_rate") && li.get("pricebook_rate") != null)
+							{
+								rateCalc = li.get("pricebook_rate").toDecimal();
+							}
+							else
+							{
+								// fallback to current line rate
+								if(li.containKey("rate") && li.get("rate") != null)
+								{
+									rateCalc = li.get("rate").toDecimal();
+								}
+							}
+						}
+						// apply explicit line discount on top
+						if(hasPctDisc == true && discPct > 0)
+						{
+							rateCalc = (rateCalc * (100 - discPct)) / 100;
+						}
+						// apply rounding according to PL
+						if(pbRounding == "round_based_on_decimal")
+						{
+							if(pbDP == 3)
+							{
+								rateCalc = rateCalc.round(3);
+							}
+							else
+							{
+								rateCalc = rateCalc.round(2);
+							}
+						}
+						else
+						{
+							rateCalc = rateCalc.round(2);
+						}
+						finalRate = rateCalc;
+					}
+					else
+					{
+						// pricebook missing → just keep line's PL rate if we have it
+						if(li.containKey("pricebook_rate") && li.get("pricebook_rate") != null)
+						{
+							finalRate = li.get("pricebook_rate").toDecimal();
+						}
+					}
+				}
+				else
+				{
+					// no price list → only item-level discount (if one was on the line)
+					if(hasPctDisc == true && discPct > 0)
+					{
+						finalRate = (newItemRate * (100 - discPct)) / 100;
+					}
+				}
+				cl.put("rate",finalRate);
+				changed = true;
+			}
+			cleanLines.add(cl);
+		}
+		if(changed == true)
+		{
+			body = Map();
+			body.put("line_items",cleanLines);
+			params = Map();
+			params.put("JSONString",body.toString());
+			upd = invokeurl
+			[
+				url :apiUrl + "/recurringinvoices/" + riId + "?organization_id=" + orgID
+				type :PUT
+				parameters:params
+				connection:"zbooks"
+			];
+			if(upd.get("code") == 0)
+			{
+				info "Updated RI " + riId;
+			}
+			else
+			{
+				info "RI " + riId + " update failed: " + upd;
+			}
+		}
+	}
+}
+info "Done updating RIs.";
